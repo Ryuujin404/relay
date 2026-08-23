@@ -1,3 +1,7 @@
+// ============================================
+// v1.3 — Fix Streaming Buffer + SSE Preserve
+// ============================================
+
 export const config = {
   runtime: 'nodejs',
   maxDuration: 300,
@@ -32,12 +36,11 @@ export default async function handler(req, res) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     const kl = k.toLowerCase();
-    if (!['x-relay-target','x-relay-path','host','content-length','connection','accept-encoding'].includes(kl)) {
+    if (!['x-relay-target','x-relay-path','host','content-length','connection'].includes(kl)) {
       headers[k] = v;
     }
   }
   headers['x-request-id'] = reqId;
-  headers['accept-encoding'] = 'identity'; // ⬇️ Jangan gzip biar bisa stream langsung
 
   let body;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -75,26 +78,35 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // ⬇️ STREAMING FIX: Set headers anti-buffer
+      // ⬇️ STREAMING FIX v1.3 — Jangan interfere dengan response upstream
       res.status(response.status);
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.setHeader('Transfer-Encoding', 'chunked');
       
-      const ct = response.headers.get('content-type');
-      if (ct) res.setHeader('Content-Type', ct);
-      
-      res.setHeader('x-proxy-req-id', reqId);
+      // Forward headers AS-IS dari upstream (jangan filter content-type)
+      response.headers.forEach((value, key) => {
+        const kl = key.toLowerCase();
+        // Skip yang bisa bikin conflict, tapi PRESERVE content-type & encoding
+        if (kl === 'content-length') return; // biar chunked
+        try { res.setHeader(key, value); } catch {}
+      });
 
+      // ⬇️ INI PENTING: Anti-buffer dari Vercel/nginx
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+
+      // ⬇️ Pipe langsung tanpa parse — paling aman buat SSE/streaming
       if (response.body) {
-        const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(Buffer.from(value));
-          if (res.flush) res.flush(); // ⬇️ Flush langsung ke client
-        }
+        // Gunakan native pipe biar nggak buffer di memory
+        const { pipeline } = require('node:stream');
+        const { Readable } = require('node:stream');
+        
+        const upstream = Readable.fromWeb(response.body);
+        pipeline(upstream, res, (err) => {
+          if (err) console.log(`[${reqId}] Pipeline error: ${err.message}`);
+        });
+      } else {
+        res.end();
       }
-      res.end();
+
       console.log(`[${reqId}] ✅ ${response.status} ${Date.now()-start}ms (try:${attempt})`);
       return;
 
