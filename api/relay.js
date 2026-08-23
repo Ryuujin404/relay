@@ -1,7 +1,3 @@
-// ============================================
-// v1.3 — Fix Streaming Buffer + SSE Preserve
-// ============================================
-
 export const config = {
   runtime: 'nodejs',
   maxDuration: 300,
@@ -9,8 +5,9 @@ export const config = {
 };
 
 const UPSTREAM_TIMEOUT = 290_000;
-const CONNECT_TIMEOUT = 15_000;
+const CONNECT_TIMEOUT = 15_000;   // ⬅️ Baru: 15 detik buat connect
 const MAX_RETRIES = 2;
+const MAX_BODY_MB = 50;
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -20,6 +17,7 @@ export default async function handler(req, res) {
   const reqId = req.headers['x-request-id'] || uid();
   const start = Date.now();
 
+  // CORS
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -33,15 +31,15 @@ export default async function handler(req, res) {
 
   const targetUrl = target.replace(/\/$/, '') + relayPath;
 
+  // Headers
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     const kl = k.toLowerCase();
-    if (!['x-relay-target','x-relay-path','host','content-length','connection'].includes(kl)) {
-      headers[k] = v;
-    }
+    if (!['x-relay-target','x-relay-path','host','content-length','connection'].includes(kl)) headers[k] = v;
   }
   headers['x-request-id'] = reqId;
 
+  // Body
   let body;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     const chunks = [];
@@ -54,7 +52,12 @@ export default async function handler(req, res) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const ctrl = new AbortController();
     const totalTimer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT);
-    const connectTimer = setTimeout(() => ctrl.abort(), CONNECT_TIMEOUT);
+
+    // ⬅️ Baru: Connect timeout terpisah
+    const connectTimer = setTimeout(() => {
+      console.log(`[${reqId}] ⏱ Connect timeout (15s)`);
+      ctrl.abort();
+    }, CONNECT_TIMEOUT);
 
     try {
       const response = await fetch(targetUrl, {
@@ -67,46 +70,37 @@ export default async function handler(req, res) {
       clearTimeout(totalTimer);
       clearTimeout(connectTimer);
 
+      // ⬅️ Baru: Response size guard
       const cl = response.headers.get('content-length');
-      if (cl && parseInt(cl) > 50 * 1024 * 1024) {
+      if (cl && parseInt(cl) > MAX_BODY_MB * 1024 * 1024) {
         return res.status(413).json({ error: 'Response too large', reqId });
       }
 
+      // Retry kalau 502/503/504
       if (response.status >= 502 && response.status <= 504 && attempt < MAX_RETRIES) {
         console.log(`[${reqId}] ⚠ ${response.status}, retry ${attempt}/${MAX_RETRIES}`);
         await new Promise(r => setTimeout(r, 1000));
         continue;
       }
 
-      // ⬇️ STREAMING FIX v1.3 — Jangan interfere dengan response upstream
+      // Stream response
       res.status(response.status);
-      
-      // Forward headers AS-IS dari upstream (jangan filter content-type)
-      response.headers.forEach((value, key) => {
-        const kl = key.toLowerCase();
-        // Skip yang bisa bikin conflict, tapi PRESERVE content-type & encoding
-        if (kl === 'content-length') return; // biar chunked
-        try { res.setHeader(key, value); } catch {}
+      res.setHeader('x-proxy-req-id', reqId);
+      response.headers.forEach((v, k) => {
+        if (!['content-encoding','transfer-encoding'].includes(k.toLowerCase())) {
+          try { res.setHeader(k, v); } catch {}
+        }
       });
 
-      // ⬇️ INI PENTING: Anti-buffer dari Vercel/nginx
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-
-      // ⬇️ Pipe langsung tanpa parse — paling aman buat SSE/streaming
       if (response.body) {
-        // Gunakan native pipe biar nggak buffer di memory
-        const { pipeline } = require('node:stream');
-        const { Readable } = require('node:stream');
-        
-        const upstream = Readable.fromWeb(response.body);
-        pipeline(upstream, res, (err) => {
-          if (err) console.log(`[${reqId}] Pipeline error: ${err.message}`);
-        });
-      } else {
-        res.end();
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
       }
-
+      res.end();
       console.log(`[${reqId}] ✅ ${response.status} ${Date.now()-start}ms (try:${attempt})`);
       return;
 
@@ -114,6 +108,7 @@ export default async function handler(req, res) {
       clearTimeout(totalTimer);
       clearTimeout(connectTimer);
       lastErr = err;
+
       const retryable = err.name === 'AbortError' || ['ECONNRESET','ETIMEDOUT','ECONNREFUSED'].includes(err.code);
       if (retryable && attempt < MAX_RETRIES) {
         console.log(`[${reqId}] ⚠ ${err.name||err.code}, retry ${attempt}/${MAX_RETRIES}`);
