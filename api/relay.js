@@ -1,38 +1,41 @@
 export const config = {
-  runtime: "nodejs",   // ⬇️ ganti dari "edge" ke "nodejs" (timeout bisa 300s)
-  maxDuration: 300,    // ⬆️ 5 menit
+  maxDuration: 300,
 };
 
-export default async function handler(req) {
-  const target = req.headers.get("x-relay-target");
-  const relayPath = req.headers.get("x-relay-path") || "/";
+export default async function handler(req, res) {
+  const target = req.headers['x-relay-target'];
+  const relayPath = req.headers['x-relay-path'] || '/';
+  
   if (!target) {
-    return new Response(JSON.stringify({ error: "Missing x-relay-target header" }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
+    return res.status(400).json({ error: 'Missing x-relay-target header' });
   }
 
-  const targetUrl = target.replace(/\/$/, "") + relayPath;
+  const targetUrl = target.replace(/\/$/, '') + relayPath;
 
-  const headers = new Headers(req.headers);
-  headers.delete("x-relay-target");
-  headers.delete("x-relay-path");
-  headers.delete("host");
+  // Bersihin headers
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (key !== 'x-relay-target' && key !== 'x-relay-path' && key !== 'host' && key !== 'content-length') {
+      headers[key] = value;
+    }
+  }
 
-  // ⬇️ TAMBAH: AbortController biar nggak hang selamanya
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), 290000);
+  try {
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
+    });
 
-  const response = await fetch(targetUrl, {
-    method: req.method,
-    headers,
-    body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
-    signal: controller.signal,   // ⬆️ pakai signal
-  });
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: response.headers,
-  });
+    res.status(response.status);
+    for (const [key, value] of response.headers) {
+      res.setHeader(key, value);
+    }
+    
+    const body = await response.text();
+    res.send(body);
+    
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
 }
