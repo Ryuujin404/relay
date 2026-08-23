@@ -1,4 +1,7 @@
-export const config = { runtime: "edge" };
+export const config = {
+  runtime: "nodejs",   // ⬇️ ganti dari "edge" ke "nodejs" (timeout bisa 300s)
+  maxDuration: 300,    // ⬆️ 5 menit
+};
 
 export default async function handler(req) {
   const target = req.headers.get("x-relay-target");
@@ -16,32 +19,16 @@ export default async function handler(req) {
   headers.delete("x-relay-target");
   headers.delete("x-relay-path");
   headers.delete("host");
-  headers.delete("content-length");
-  
-  // ⬇️ TAMBAHIN INI: Force Accept header ke text/event-stream (format streaming)
-  headers.set("Accept", "text/event-stream, application/json");
 
-  let body = undefined;
-
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    const text = await req.text();
-    try {
-      const json = JSON.parse(text);
-      if (json.stream === false) {
-        json.stream = true;
-        console.log("[PROXY] Forced stream: false → true");
-      }
-      body = JSON.stringify(json);
-    } catch {
-      body = text;
-    }
-  }
+  // ⬇️ TAMBAH: AbortController biar nggak hang selamanya
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 290000);
 
   const response = await fetch(targetUrl, {
     method: req.method,
     headers,
-    body,
-    duplex: "half",
+    body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+    signal: controller.signal,   // ⬆️ pakai signal
   });
 
   return new Response(response.body, {
