@@ -16,11 +16,13 @@ export default async function handler(req) {
   headers.delete("x-relay-target");
   headers.delete("x-relay-path");
   headers.delete("host");
-  headers.delete("content-length"); // biar fetch auto-calculate ulang
+  headers.delete("content-length");
+  
+  // ⬇️ TAMBAHIN INI: Force Accept header ke text/event-stream (format streaming)
+  headers.set("Accept", "text/event-stream, application/json");
 
   let body = undefined;
 
-  // ⬇️ INI YANG DITAMBAH: Parse body, force stream: true
   if (req.method !== "GET" && req.method !== "HEAD") {
     const text = await req.text();
     try {
@@ -31,7 +33,6 @@ export default async function handler(req) {
       }
       body = JSON.stringify(json);
     } catch {
-      // Bukan JSON, kirim as-is
       body = text;
     }
   }
