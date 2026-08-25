@@ -50,7 +50,7 @@ export default async function handler(req, res) {
   const start = Date.now();
 
   if (req.url === '/health') {
-    return res.status(200).json({ status: 'ok', uptime: process.uptime(), circuits: Object.fromEntries(circuitStates), version: '2.2-jsonfix' });
+    return res.status(200).json({ status: 'ok', uptime: process.uptime(), circuits: Object.fromEntries(circuitStates), version: '2.4' });
   }
 
   if (req.method === 'OPTIONS') {
@@ -179,55 +179,33 @@ export default async function handler(req, res) {
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('x-proxy-req-id', reqId);
 
-      // ── STREAMING VS JSON FIX ──
       if (response.body) {
-        const ct = response.headers.get('content-type') || '';
-        const isSSE = ct.includes('text/event-stream');
+        const { pipeline } = require('node:stream');
+        const { Readable } = require('node:stream');
+        const upstream = Readable.fromWeb(response.body);
 
-        if (isSSE) {
-          // SSE/Streaming: pipeline (zero buffer)
-          const { pipeline } = require('node:stream');
-          const { Readable } = require('node:stream');
-          const upstream = Readable.fromWeb(response.body);
-
-          resetStall();
-          upstream.on('data', () => {
-            if (!firstByteReceived) {
-              firstByteReceived = true;
-              console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms`);
-            }
-            resetStall();
-          });
-
-          await new Promise((resolve, reject) => {
-            pipeline(upstream, res, (err) => {
-              cleanup();
-              if (!err) return resolve();
-              if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-                console.log(`[${reqId}] ⚡ CLIENT_CLOSED_STREAM`);
-                return resolve();
-              }
-              if (err.name === 'AbortError' || err.message?.includes('abort')) return reject(err);
-              console.log(`[${reqId}] Pipeline error: ${err.message}`);
-              reject(err);
-            });
-          });
-
-        } else {
-          // JSON/Non-streaming: buffer lalu send (lebih aman)
-          const chunks = [];
-          const reader = response.body.getReader();
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
+        resetStall();
+        upstream.on('data', () => {
+          if (!firstByteReceived) {
+            firstByteReceived = true;
+            console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms`);
           }
+          resetStall();
+        });
 
-          const buf = Buffer.concat(chunks.map(b => Buffer.from(b)));
-          res.setHeader('Content-Length', buf.length);
-          res.end(buf);
-        }
+        await new Promise((resolve, reject) => {
+          pipeline(upstream, res, (err) => {
+            cleanup();
+            if (!err) return resolve();
+            if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+              console.log(`[${reqId}] ⚡ CLIENT_CLOSED_STREAM`);
+              return resolve();
+            }
+            if (err.name === 'AbortError' || err.message?.includes('abort')) return reject(err);
+            console.log(`[${reqId}] Pipeline error: ${err.message}`);
+            reject(err);
+          });
+        });
 
         console.log(`[${reqId}] ✅ DONE ${response.status} in ${Date.now() - start}ms`);
         return;
