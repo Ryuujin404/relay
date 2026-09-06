@@ -1,3 +1,5 @@
+import { pipeline, Readable } from 'node:stream';
+
 export const config = {
   runtime: 'nodejs',
   maxDuration: 300,
@@ -6,30 +8,30 @@ export const config = {
 
 const UPSTREAM_TIMEOUT   = 290_000;
 const CONNECT_TIMEOUT    = 15_000;
-const FIRST_BYTE_TIMEOUT = 180_000;
 const INTER_BYTE_TIMEOUT = 45_000;
+const FIRST_DATA_WAIT_MS = 60_000;  // ← NEW: max tunggu body bytes sebelum retry
 const MAX_RETRIES        = 3;
 const MAX_BACKOFF_MS     = 8_000;
 const CIRCUIT_THRESHOLD  = 3;
 const CIRCUIT_COOLDOWN   = 60_000;
+const MAX_RESPONSE_SIZE  = 50 * 1024 * 1024;
+
+const STRIP_HEADERS = new Set([
+  'x-relay-target', 'x-relay-path', 'host',
+  'content-length', 'connection', 'transfer-encoding',
+]);
 
 const circuitStates = new Map();
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function getCircuit(hostname) {
   const now = Date.now();
   const s = circuitStates.get(hostname);
   if (!s) return { open: false };
-  if (s.failures >= CIRCUIT_THRESHOLD && (now - s.lastFail) < CIRCUIT_COOLDOWN) {
+  if (s.failures >= CIRCUIT_THRESHOLD && (now - s.lastFail) < CIRCUIT_COOLDOWN)
     return { open: true, until: s.lastFail + CIRCUIT_COOLDOWN };
-  }
   if ((now - s.lastFail) >= CIRCUIT_COOLDOWN) circuitStates.delete(hostname);
   return { open: false };
 }
@@ -41,41 +43,88 @@ function recordFail(hostname) {
   circuitStates.set(hostname, e);
 }
 
-function recordSuccess(hostname) {
-  circuitStates.delete(hostname);
+function recordSuccess(hostname) { circuitStates.delete(hostname); }
+
+function applyCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-relay-target, x-relay-path, x-request-id');
+}
+
+// ─── Wait for first actual body bytes before committing headers to client ───
+// Returns first chunk, or throws if:
+//   - STREAM_EMPTY: stream ended with 0 bytes
+//   - FIRST_DATA_TIMEOUT: no bytes arrived within FIRST_DATA_WAIT_MS
+//   - Other error: network/abort error
+function waitFirstChunk(upstream) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const done = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      upstream.removeListener('data', onData);
+      upstream.removeListener('end', onEnd);
+      upstream.removeListener('error', onError);
+      fn(val);
+    };
+
+    const timer = setTimeout(
+      () => done(reject, Object.assign(new Error('FIRST_DATA_TIMEOUT'), { code: 'FIRST_DATA_TIMEOUT' })),
+      FIRST_DATA_WAIT_MS
+    );
+
+    const onData  = (chunk) => { upstream.pause(); done(resolve, chunk); };
+    const onEnd   = ()      => done(reject, Object.assign(new Error('STREAM_EMPTY'), { code: 'STREAM_EMPTY' }));
+    const onError = (err)   => done(reject, err);
+
+    upstream.once('data', onData);
+    upstream.once('end', onEnd);
+    upstream.once('error', onError);
+  });
 }
 
 export default async function handler(req, res) {
   const reqId = req.headers['x-request-id'] || uid();
   const start = Date.now();
 
-  if (req.url === '/health') {
-    return res.status(200).json({ status: 'ok', uptime: process.uptime(), circuits: Object.fromEntries(circuitStates), version: '2.4' });
+  applyCors(res);
+
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
+  if (req.url?.split('?')[0] === '/health') {
+    return res.status(200).json({
+      status: 'ok', uptime: process.uptime(),
+      circuits: Object.fromEntries(circuitStates),
+      version: '2.6',
+    });
   }
 
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-relay-target, x-relay-path, x-request-id');
-    return res.status(204).end();
-  }
-
-  const target = req.headers['x-relay-target'];
+  const target    = req.headers['x-relay-target'];
   const relayPath = req.headers['x-relay-path'] || '/';
   if (!target) return res.status(400).json({ error: 'Missing x-relay-target', reqId });
 
-  const targetUrl = target.replace(/\/$/, '') + relayPath;
-  const hostname = new URL(targetUrl).hostname;
+  let targetUrl, hostname;
+  try {
+    targetUrl = target.replace(/\/$/, '') + relayPath;
+    hostname  = new URL(targetUrl).hostname;
+  } catch {
+    return res.status(400).json({ error: 'Invalid x-relay-target URL', reqId });
+  }
 
-  const circ = getCircuit(hostname);
-  if (circ.open) {
-    return res.status(503).json({ error: 'Service Unavailable', message: `${hostname} circuit open`, retryAfter: Math.ceil((circ.until - Date.now()) / 1000), reqId });
+  const initCirc = getCircuit(hostname);
+  if (initCirc.open) {
+    return res.status(503).json({
+      error: 'Service Unavailable',
+      message: `${hostname} circuit open`,
+      retryAfter: Math.ceil((initCirc.until - Date.now()) / 1000), reqId,
+    });
   }
 
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    const kl = k.toLowerCase();
-    if (!['x-relay-target','x-relay-path','host','content-length','connection'].includes(kl)) headers[k] = v;
+    if (!STRIP_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
   headers['x-request-id'] = reqId;
 
@@ -84,26 +133,40 @@ export default async function handler(req, res) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString();
-    if (raw) { JSON.parse(raw); body = raw; }
+    if (raw) {
+      try { JSON.parse(raw); body = raw; }
+      catch { return res.status(400).json({ error: 'Invalid JSON body', reqId }); }
+    }
   }
 
   let clientGone = false;
   req.on('close', () => { clientGone = true; });
   req.on('error', () => { clientGone = true; });
 
-  let lastErr;
-  let lastStatus;
+  let lastErr, lastStatus;
+  let streamingStarted = false;
+  let totalAttempts = 0;
 
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+    totalAttempts = attempt;
+
     if (clientGone) {
       console.log(`[${reqId}] ⚡ CLIENT_GONE before attempt ${attempt}`);
       return;
     }
 
+    if (attempt > 1) {
+      const circCheck = getCircuit(hostname);
+      if (circCheck.open) {
+        console.log(`[${reqId}] 🔴 CIRCUIT_OPEN on attempt ${attempt}, stop retrying`);
+        lastErr = new Error(`Circuit open for ${hostname}`);
+        break;
+      }
+    }
+
     const ctrl = new AbortController();
     let totalTimer, connectTimer, stallTimer;
     let isConnected = false;
-    let firstByteReceived = false;
 
     const cleanup = () => {
       clearTimeout(totalTimer);
@@ -113,42 +176,45 @@ export default async function handler(req, res) {
 
     const resetStall = () => {
       clearTimeout(stallTimer);
-      const t = firstByteReceived ? INTER_BYTE_TIMEOUT : FIRST_BYTE_TIMEOUT;
       stallTimer = setTimeout(() => {
-        const phase = firstByteReceived ? 'inter-byte' : 'first-byte';
-        console.log(`[${reqId}] ⏱ STALL_TIMEOUT [${phase}] attempt ${attempt}`);
+        console.log(`[${reqId}] ⏱ INTER_BYTE_STALL attempt ${attempt}`);
         ctrl.abort();
-      }, t);
+      }, INTER_BYTE_TIMEOUT);
     };
 
     try {
-      totalTimer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT);
+      totalTimer   = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT);
       connectTimer = setTimeout(() => { if (!isConnected) ctrl.abort(); }, CONNECT_TIMEOUT);
 
       console.log(`[${reqId}] 🔄 ATTEMPT ${attempt}/${MAX_RETRIES + 1} → ${targetUrl}`);
 
-      const response = await fetch(targetUrl, { method: req.method, headers, body, signal: ctrl.signal });
+      const response = await fetch(targetUrl, {
+        method: req.method, headers, body, signal: ctrl.signal,
+      });
 
       isConnected = true;
       clearTimeout(connectTimer);
 
       const cl = response.headers.get('content-length');
-      if (cl && parseInt(cl) > 50 * 1024 * 1024) {
+      if (cl && parseInt(cl) > MAX_RESPONSE_SIZE) {
         cleanup();
         return res.status(413).json({ error: 'Response too large', reqId });
       }
 
       lastStatus = response.status;
 
+      // ── 429: forward rate limit ──
       if (response.status === 429) {
         cleanup();
         const ra = response.headers.get('retry-after') || '60';
         res.setHeader('Retry-After', ra);
+        res.setHeader('x-proxy-req-id', reqId);
         res.status(429);
         response.headers.forEach((v, k) => { try { res.setHeader(k, v); } catch {} });
         return res.send(await response.text());
       }
 
+      // ── 502-504: retry with backoff ──
       if (response.status >= 502 && response.status <= 504) {
         recordFail(hostname);
         cleanup();
@@ -158,51 +224,78 @@ export default async function handler(req, res) {
           await sleep(backoff);
           continue;
         }
+        lastErr = new Error(`Upstream returned ${response.status}`);
+        break;
       }
 
       if (response.status >= 200 && response.status < 300) recordSuccess(hostname);
 
+      // ── 4xx client error: forward as-is ──
       if (response.status >= 400 && response.status < 500) {
         cleanup();
+        res.setHeader('x-proxy-req-id', reqId);
         res.status(response.status);
         response.headers.forEach((v, k) => { try { res.setHeader(k, v); } catch {} });
         return res.send(await response.text());
       }
 
-      res.status(response.status);
-      response.headers.forEach((v, k) => {
-        if (k.toLowerCase() === 'content-length') return;
-        try { res.setHeader(k, v); } catch {}
-      });
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('x-proxy-req-id', reqId);
-
+      // ── 2xx: TWO-PHASE RESPONSE ──
       if (response.body) {
-        const { pipeline } = require('node:stream');
-        const { Readable } = require('node:stream');
         const upstream = Readable.fromWeb(response.body);
 
-        resetStall();
-        upstream.on('data', () => {
-          if (!firstByteReceived) {
-            firstByteReceived = true;
-            console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms`);
+        // ── PHASE 1: tunggu first body bytes (JANGAN kirim headers dulu) ──
+        let firstChunk;
+        try {
+          firstChunk = await waitFirstChunk(upstream);
+        } catch (phaseErr) {
+          // Body kosong / timeout → AMAN untuk retry karena headers BELUM dikirim
+          upstream.destroy();
+          cleanup();
+          recordFail(hostname);
+
+          const reason = phaseErr.code || phaseErr.message;
+          console.log(`[${reqId}] ⚠ ${reason} attempt ${attempt} — 0 body bytes, retrying`);
+
+          if (attempt <= MAX_RETRIES && !clientGone) {
+            const backoff = Math.min(1000 * Math.pow(2, attempt - 1), MAX_BACKOFF_MS);
+            console.log(`[${reqId}] 🔁 RETRY ${attempt + 1} in ${backoff}ms`);
+            await sleep(backoff);
+            continue; // ✅ RETRY AMAN
           }
-          resetStall();
+
+          lastErr = phaseErr;
+          break;
+        }
+
+        // ── PHASE 2: first chunk tiba → baru commit headers ke client ──
+        streamingStarted = true;
+        console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms`);
+
+        res.status(response.status);
+        response.headers.forEach((v, k) => {
+          if (k.toLowerCase() === 'content-length') return;
+          try { res.setHeader(k, v); } catch {}
         });
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('x-proxy-req-id', reqId);
+
+        // Kembalikan chunk pertama ke depan stream, lalu pipe semuanya
+        upstream.unshift(firstChunk);
+        resetStall();
+        upstream.on('data', () => resetStall());
 
         await new Promise((resolve, reject) => {
           pipeline(upstream, res, (err) => {
             cleanup();
             if (!err) return resolve();
-            if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+            if (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || clientGone) {
               console.log(`[${reqId}] ⚡ CLIENT_CLOSED_STREAM`);
               return resolve();
             }
             if (err.name === 'AbortError' || err.message?.includes('abort')) return reject(err);
-            console.log(`[${reqId}] Pipeline error: ${err.message}`);
+            console.log(`[${reqId}] ⚠ Pipeline error: ${err.message}`);
             reject(err);
           });
         });
@@ -211,6 +304,7 @@ export default async function handler(req, res) {
         return;
       }
 
+      // No body (HEAD, dll)
       cleanup();
       res.end();
       return;
@@ -218,12 +312,24 @@ export default async function handler(req, res) {
     } catch (err) {
       cleanup();
       lastErr = err;
+
+      // Kalau sudah streaming → tidak bisa retry, tutup saja
+      if (streamingStarted) {
+        console.log(`[${reqId}] ❌ ERROR mid-stream (${Date.now() - start}ms): ${err.message}`);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
       recordFail(hostname);
 
-      const retryable = err.name === 'AbortError' || ['ECONNRESET','ETIMEDOUT','ECONNREFUSED','EPIPE','ENOTFOUND'].includes(err.code) || (err.message && err.message.includes('fetch failed'));
+      const retryable =
+        err.name === 'AbortError' ||
+        ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND'].includes(err.code) ||
+        err.message?.includes('fetch failed');
+
       if (retryable && attempt <= MAX_RETRIES) {
         const backoff = Math.min(1000 * Math.pow(2, attempt - 1), MAX_BACKOFF_MS);
-        const reason = err.name === 'AbortError' ? 'timeout' : (err.code || 'error');
+        const reason = err.name === 'AbortError' ? 'timeout' : (err.code || err.message);
         console.log(`[${reqId}] ⚠ ${reason} → backoff ${backoff}ms → retry ${attempt + 1}`);
         await sleep(backoff);
         continue;
@@ -232,9 +338,14 @@ export default async function handler(req, res) {
     }
   }
 
-  console.log(`[${reqId}] ❌ FAILED after ${MAX_RETRIES + 1} attempts`);
+  console.log(`[${reqId}] ❌ FAILED after ${totalAttempts} attempt(s) in ${Date.now() - start}ms`);
   if (!res.headersSent) {
     const code = lastStatus || (lastErr?.name === 'AbortError' ? 504 : 502);
-    res.status(code).json({ error: code === 504 ? 'Gateway Timeout' : 'Bad Gateway', message: lastErr?.message || 'Upstream failed', attempts: MAX_RETRIES + 1, reqId });
+    res.setHeader('x-proxy-req-id', reqId);
+    res.status(code).json({
+      error: code === 504 ? 'Gateway Timeout' : 'Bad Gateway',
+      message: lastErr?.message || 'Upstream failed',
+      attempts: totalAttempts, reqId,
+    });
   }
 }
