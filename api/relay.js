@@ -9,22 +9,16 @@ export const config = {
 const UPSTREAM_TIMEOUT   = 290_000;
 const CONNECT_TIMEOUT    = 15_000;
 const INTER_BYTE_TIMEOUT = 45_000;
-const FIRST_DATA_WAIT_MS = 15_000;  // turun dari 60s → 15s biar tidak stuck lama
+const FIRST_DATA_WAIT_MS = 60_000;  // ← NEW: max tunggu body bytes sebelum retry
 const MAX_RETRIES        = 3;
 const MAX_BACKOFF_MS     = 8_000;
 const CIRCUIT_THRESHOLD  = 3;
 const CIRCUIT_COOLDOWN   = 60_000;
 const MAX_RESPONSE_SIZE  = 50 * 1024 * 1024;
 
-// Strip seminimal mungkin — hanya yang WAJIB di-strip untuk HTTP correctness
-// Jangan strip origin/referer/user-agent karena OpenCode mungkin pakai itu untuk validasi
 const STRIP_HEADERS = new Set([
-  'x-relay-target',
-  'x-relay-path',
-  'host',           // wajib: host diganti sesuai upstream
-  'content-length', // wajib: akan di-set ulang oleh fetch
-  'connection',     // wajib: hop-by-hop header
-  'transfer-encoding', // wajib: hop-by-hop header
+  'x-relay-target', 'x-relay-path', 'host',
+  'content-length', 'connection', 'transfer-encoding',
 ]);
 
 const circuitStates = new Map();
@@ -57,6 +51,11 @@ function applyCors(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-relay-target, x-relay-path, x-request-id');
 }
 
+// ─── Wait for first actual body bytes before committing headers to client ───
+// Returns first chunk, or throws if:
+//   - STREAM_EMPTY: stream ended with 0 bytes
+//   - FIRST_DATA_TIMEOUT: no bytes arrived within FIRST_DATA_WAIT_MS
+//   - Other error: network/abort error
 function waitFirstChunk(upstream) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -86,12 +85,6 @@ function waitFirstChunk(upstream) {
   });
 }
 
-// Coba parse model name dari body JSON (untuk logging/debug)
-function tryGetModel(bodyStr) {
-  try { return JSON.parse(bodyStr)?.model || 'unknown'; }
-  catch { return 'unknown'; }
-}
-
 export default async function handler(req, res) {
   const reqId = req.headers['x-request-id'] || uid();
   const start = Date.now();
@@ -104,7 +97,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       status: 'ok', uptime: process.uptime(),
       circuits: Object.fromEntries(circuitStates),
-      version: '2.7',
+      version: '2.6',
     });
   }
 
@@ -129,28 +122,22 @@ export default async function handler(req, res) {
     });
   }
 
-  // Build headers — strip minimal, pertahankan sisanya termasuk origin/referer/user-agent
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!STRIP_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
   headers['x-request-id'] = reqId;
-  // Set host sesuai upstream
-  headers['host'] = hostname;
 
-  let body, bodyStr;
+  let body;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     const chunks = [];
     for await (const c of req) chunks.push(c);
-    bodyStr = Buffer.concat(chunks).toString();
-    if (bodyStr) {
-      try { JSON.parse(bodyStr); body = bodyStr; }
+    const raw = Buffer.concat(chunks).toString();
+    if (raw) {
+      try { JSON.parse(raw); body = raw; }
       catch { return res.status(400).json({ error: 'Invalid JSON body', reqId }); }
     }
   }
-
-  const model = tryGetModel(bodyStr);
-  const isResponsesEndpoint = relayPath.includes('/responses');
 
   let clientGone = false;
   req.on('close', () => { clientGone = true; });
@@ -159,10 +146,6 @@ export default async function handler(req, res) {
   let lastErr, lastStatus;
   let streamingStarted = false;
   let totalAttempts = 0;
-
-  // Kalau endpoint /responses dapat 403 FreeTierError, coba fallback ke /chat/completions
-  let currentUrl = targetUrl;
-  let triedFallback = false;
 
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
     totalAttempts = attempt;
@@ -203,9 +186,9 @@ export default async function handler(req, res) {
       totalTimer   = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT);
       connectTimer = setTimeout(() => { if (!isConnected) ctrl.abort(); }, CONNECT_TIMEOUT);
 
-      console.log(`[${reqId}] 🔄 ATTEMPT ${attempt}/${MAX_RETRIES + 1} → ${currentUrl} [model:${model}]`);
+      console.log(`[${reqId}] 🔄 ATTEMPT ${attempt}/${MAX_RETRIES + 1} → ${targetUrl}`);
 
-      const response = await fetch(currentUrl, {
+      const response = await fetch(targetUrl, {
         method: req.method, headers, body, signal: ctrl.signal,
       });
 
@@ -219,26 +202,6 @@ export default async function handler(req, res) {
       }
 
       lastStatus = response.status;
-
-      // ── 403 FreeTierError: coba fallback /responses → /chat/completions ──
-      if (response.status === 403 && isResponsesEndpoint && !triedFallback) {
-        let errBody = '';
-        try { errBody = await response.text(); } catch {}
-
-        if (errBody.includes('FreeTierError') || errBody.includes('free tier')) {
-          triedFallback = true;
-          cleanup();
-
-          // Ganti URL: /responses → /chat/completions
-          const baseTarget = target.replace(/\/$/, '');
-          currentUrl = baseTarget + '/chat/completions';
-          console.log(`[${reqId}] ⚠ 403 FreeTierError on /responses → fallback to /chat/completions [model:${model}]`);
-
-          // Lanjut ke attempt berikutnya tanpa increment retry counter
-          attempt--; // jangan hitung ini sebagai retry
-          continue;
-        }
-      }
 
       // ── 429: forward rate limit ──
       if (response.status === 429) {
@@ -280,11 +243,12 @@ export default async function handler(req, res) {
       if (response.body) {
         const upstream = Readable.fromWeb(response.body);
 
-        // PHASE 1: tunggu first chunk sebelum commit headers
+        // ── PHASE 1: tunggu first body bytes (JANGAN kirim headers dulu) ──
         let firstChunk;
         try {
           firstChunk = await waitFirstChunk(upstream);
         } catch (phaseErr) {
+          // Body kosong / timeout → AMAN untuk retry karena headers BELUM dikirim
           upstream.destroy();
           cleanup();
           recordFail(hostname);
@@ -296,16 +260,16 @@ export default async function handler(req, res) {
             const backoff = Math.min(1000 * Math.pow(2, attempt - 1), MAX_BACKOFF_MS);
             console.log(`[${reqId}] 🔁 RETRY ${attempt + 1} in ${backoff}ms`);
             await sleep(backoff);
-            continue;
+            continue; // ✅ RETRY AMAN
           }
 
           lastErr = phaseErr;
           break;
         }
 
-        // PHASE 2: first chunk tiba → commit headers ke client
+        // ── PHASE 2: first chunk tiba → baru commit headers ke client ──
         streamingStarted = true;
-        console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms [model:${model}] [url:${currentUrl}]`);
+        console.log(`[${reqId}] 📥 FIRST_BYTE after ${Date.now() - start}ms`);
 
         res.status(response.status);
         response.headers.forEach((v, k) => {
@@ -317,6 +281,7 @@ export default async function handler(req, res) {
         res.setHeader('Connection', 'keep-alive');
         res.setHeader('x-proxy-req-id', reqId);
 
+        // Kembalikan chunk pertama ke depan stream, lalu pipe semuanya
         upstream.unshift(firstChunk);
         resetStall();
         upstream.on('data', () => resetStall());
@@ -335,7 +300,7 @@ export default async function handler(req, res) {
           });
         });
 
-        console.log(`[${reqId}] ✅ DONE ${response.status} in ${Date.now() - start}ms [model:${model}]`);
+        console.log(`[${reqId}] ✅ DONE ${response.status} in ${Date.now() - start}ms`);
         return;
       }
 
@@ -348,6 +313,7 @@ export default async function handler(req, res) {
       cleanup();
       lastErr = err;
 
+      // Kalau sudah streaming → tidak bisa retry, tutup saja
       if (streamingStarted) {
         console.log(`[${reqId}] ❌ ERROR mid-stream (${Date.now() - start}ms): ${err.message}`);
         if (!res.writableEnded) res.end();
@@ -366,7 +332,7 @@ export default async function handler(req, res) {
         const reason = err.name === 'AbortError' ? 'timeout' : (err.code || err.message);
         console.log(`[${reqId}] ⚠ ${reason} → backoff ${backoff}ms → retry ${attempt + 1}`);
         await sleep(backoff);
-        continue;
+        continue;a
       }
       break;
     }
